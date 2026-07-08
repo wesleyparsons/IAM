@@ -108,7 +108,10 @@ function Get-ReviewDefinitionsForPackage {
     # Access package review definitions are ordinary accessReviews/definitions whose
     # scope.query embeds the access package's id (there's no direct "reviews for this
     # package" endpoint), so definitions are pulled once and matched by ID substring.
-    $allDefinitions = Get-MgIdentityGovernanceAccessReviewDefinition -All -ExpandProperty Instances
+    # Do NOT use -ExpandProperty Instances here: for entitlement-management (access
+    # package) reviews it hits a backend path that throws "BusinessFlow not found for
+    # Id" 404s. Instances are fetched separately in Get-LatestInstance instead.
+    $allDefinitions = Get-MgIdentityGovernanceAccessReviewDefinition -All
 
     return $allDefinitions | Where-Object {
         $scopeQuery = $_.Scope.AdditionalProperties['query']
@@ -124,7 +127,7 @@ function Get-LatestInstance {
 
     if (-not $instances) { return $null }
 
-    $completed = $instances | Where-Object { $_.Status -eq 'Completed' }
+    $completed = $instances | Where-Object { $_.Status -in @('Completed', 'Applied') }
     $pool = if ($completed) { $completed } else { $instances }
 
     return $pool | Sort-Object EndDateTime -Descending | Select-Object -First 1
