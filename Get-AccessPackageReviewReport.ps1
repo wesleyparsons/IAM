@@ -122,8 +122,26 @@ function Get-ReviewDefinitionsForPackage {
 function Get-LatestInstance {
     param($Definition)
 
-    $instances = Get-MgIdentityGovernanceAccessReviewDefinitionInstance `
-        -AccessReviewScheduleDefinitionId $Definition.Id -All
+    try {
+        $instances = Get-MgIdentityGovernanceAccessReviewDefinitionInstance `
+            -AccessReviewScheduleDefinitionId $Definition.Id -All -ErrorAction Stop
+    }
+    catch {
+        # v1.0 sometimes can't resolve instances for entitlement-management (access
+        # package) reviews ("BusinessFlow not found for Id"); the beta endpoint for
+        # the same resource does. Fall back to a direct REST call before giving up.
+        Write-Warning "    v1.0 instance lookup failed for '$($Definition.DisplayName)' ($($Definition.Id)): $($_.Exception.Message). Retrying against beta..."
+        try {
+            $betaResult = Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/beta/identityGovernance/accessReviews/definitions/$($Definition.Id)/instances?`$top=999" `
+                -ErrorAction Stop
+            $instances = $betaResult.value
+        }
+        catch {
+            Write-Warning "    beta instance lookup also failed for '$($Definition.DisplayName)' ($($Definition.Id)): $($_.Exception.Message)"
+            return $null
+        }
+    }
 
     if (-not $instances) { return $null }
 
@@ -133,23 +151,62 @@ function Get-LatestInstance {
     return $pool | Sort-Object EndDateTime -Descending | Select-Object -First 1
 }
 
+# Beta REST fallback returns plain (camelCase) hashtables instead of the typed
+# SDK model, so property lookups have to work for both shapes.
+function Get-Prop {
+    param($Obj, [string]$Name)
+
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) { return $Obj[$Name] }
+
+    $val = $Obj.$Name
+    if ($null -ne $val) { return $val }
+
+    # SDK's AdditionalProperties is a case-sensitive Dictionary<string,object> holding
+    # Graph's original camelCase keys, so a PascalCase lookup needs a camelCase fallback.
+    if ($Obj.AdditionalProperties) {
+        if ($Obj.AdditionalProperties.ContainsKey($Name)) { return $Obj.AdditionalProperties[$Name] }
+        $camelName = $Name.Substring(0, 1).ToLower() + $Name.Substring(1)
+        if ($Obj.AdditionalProperties.ContainsKey($camelName)) { return $Obj.AdditionalProperties[$camelName] }
+    }
+    return $null
+}
+
 function Get-DecisionRows {
     param($AccessPackage, $Definition, $Instance)
 
-    $decisions = Get-MgIdentityGovernanceAccessReviewDefinitionInstanceDecision `
-        -AccessReviewScheduleDefinitionId $Definition.Id `
-        -AccessReviewInstanceId $Instance.Id `
-        -All
+    $instanceId = Get-Prop $Instance 'Id'
+
+    try {
+        $decisions = Get-MgIdentityGovernanceAccessReviewDefinitionInstanceDecision `
+            -AccessReviewScheduleDefinitionId $Definition.Id `
+            -AccessReviewInstanceId $instanceId `
+            -All -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "    v1.0 decision lookup failed for '$($Definition.DisplayName)' instance $instanceId : $($_.Exception.Message). Retrying against beta..."
+        try {
+            $betaResult = Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/beta/identityGovernance/accessReviews/definitions/$($Definition.Id)/instances/$instanceId/decisions?`$top=999" `
+                -ErrorAction Stop
+            $decisions = $betaResult.value
+        }
+        catch {
+            Write-Warning "    beta decision lookup also failed for '$($Definition.DisplayName)' instance $instanceId : $($_.Exception.Message)"
+            return @()
+        }
+    }
 
     foreach ($d in $decisions) {
+        $reviewedBy = Get-Prop $d 'ReviewedBy'
         [PSCustomObject]@{
             AccessPackage = $AccessPackage.DisplayName
             ReviewName    = $Definition.DisplayName
-            ReviewEnded   = $Instance.EndDateTime
-            User          = $d.Principal.AdditionalProperties['displayName']
-            Reviewer      = if ($d.ReviewedBy) { $d.ReviewedBy.DisplayName } else { '(not reviewed)' }
-            Outcome       = $d.Decision
-            Justification = $d.Justification
+            ReviewEnded   = Get-Prop $Instance 'EndDateTime'
+            User          = Get-Prop (Get-Prop $d 'Principal') 'DisplayName'
+            Reviewer      = if ($reviewedBy) { Get-Prop $reviewedBy 'DisplayName' } else { '(not reviewed)' }
+            Outcome       = Get-Prop $d 'Decision'
+            Justification = Get-Prop $d 'Justification'
         }
     }
 }
